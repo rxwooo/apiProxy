@@ -1,3 +1,7 @@
 .claude
 .codex
 .github
+node_modules/
+.env
+coverage/
+npm-debug.log*

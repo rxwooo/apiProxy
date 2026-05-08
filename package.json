@@ -1,0 +1,19 @@
+{
+  "name": "api-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start:local": "node src/local/index.js",
+    "start:relay": "node src/remote/index.js",
+    "test": "node --test",
+    "test:unit": "node --test test/unit/*.test.js",
+    "test:integration": "node --test test/integration/*.test.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
