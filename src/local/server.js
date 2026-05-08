@@ -114,7 +114,11 @@ function writeGatewayError(response, error, logger) {
   logger?.warn('local_request_failed', {
     code: error.code,
     status: error.status,
-    message: error.message
+    message: error.message,
+    relayProxyConfigured: error.relayProxyConfigured,
+    relayProxyEnabled: error.relayProxyEnabled,
+    relayProxyBypassed: error.relayProxyBypassed,
+    relayProxyHost: error.relayProxyHost
   });
 
   if (response.headersSent) {

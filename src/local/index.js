@@ -12,7 +12,8 @@ server.listen(config.port, config.host, () => {
   logger.info('local_proxy_started', {
     host: config.host,
     port: config.port,
-    relayUrl: config.relayUrl
+    relayUrl: config.relayUrl,
+    ...config.relayProxyDiagnostics
   });
 });
 

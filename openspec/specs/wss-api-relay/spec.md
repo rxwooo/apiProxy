@@ -34,6 +34,37 @@ The system SHALL establish an authenticated WSS session between the local proxy 
 - **WHEN** the WSS session remains open without active requests
 - **THEN** the local proxy and remote relay MUST use ping/pong or equivalent health checks to detect broken connections
 
+### Requirement: Explicit local relay outbound proxy
+The local proxy SHALL support an explicitly configured outbound proxy for the WebSocket connection to the remote relay.
+
+#### Scenario: Relay proxy is configured
+- **WHEN** the local proxy starts with a valid `RELAY_PROXY` configuration
+- **THEN** the local relay client MUST establish the remote relay WebSocket connection through that proxy
+
+#### Scenario: Relay proxy is not configured
+- **WHEN** the local proxy starts without `RELAY_PROXY`
+- **THEN** the local relay client MUST preserve the existing direct WebSocket connection behavior
+
+#### Scenario: Relay proxy configuration is invalid
+- **WHEN** the local proxy starts with a malformed or unsupported `RELAY_PROXY` value
+- **THEN** startup validation MUST reject the configuration with a clear error
+
+#### Scenario: Relay host matches proxy bypass list
+- **WHEN** `RELAY_PROXY` is configured and the relay host matches `RELAY_NO_PROXY`
+- **THEN** the local relay client MUST connect directly to the relay without using the proxy
+
+#### Scenario: Proxied relay authentication succeeds
+- **WHEN** the local relay client connects through a proxy with valid relay credentials
+- **THEN** the remote relay MUST receive the normal relay authentication and accept the WSS session
+
+#### Scenario: Proxied relay connection fails
+- **WHEN** the local relay client cannot establish the WebSocket connection through the configured proxy
+- **THEN** the local proxy MUST return a gateway-style error and log diagnostic metadata indicating proxy mode was used
+
+#### Scenario: Proxy URL contains credentials
+- **WHEN** `RELAY_PROXY` includes username or password information
+- **THEN** logs MUST redact proxy credentials while preserving non-sensitive diagnostic information such as proxy host and port
+
 ### Requirement: Chunked request transport
 The system SHALL transmit local HTTP request data over WSS using application-level chunks that do not exceed the configured maximum chunk size.
 
@@ -163,3 +194,78 @@ The system SHALL protect credentials and prompt data handled by the relay.
 #### Scenario: Local proxy configuration is used
 - **WHEN** an agent is configured to use the local proxy
 - **THEN** the agent MUST NOT need direct access to the third-party provider API key when the remote relay is configured with upstream credentials
+
+### Requirement: Application-layer relay encryption
+The system SHALL support an application-layer encrypted relay envelope between the local proxy and the remote relay so that relay message contents remain confidential from intermediaries that can inspect the outer WSS/TLS connection.
+
+#### Scenario: Encrypted relay session is established
+- **WHEN** the local proxy and remote relay are configured with compatible E2EE mode, key id, pre-shared key, and encryption suite
+- **THEN** the local proxy and remote relay MUST complete an E2EE handshake before relaying application requests
+- **AND** both sides MUST derive fresh per-session encryption keys from the configured key material and per-session nonces
+
+#### Scenario: Relay messages are sealed after handshake
+- **WHEN** an E2EE handshake has completed successfully
+- **THEN** the local proxy MUST send relay request metadata, request chunks, request completion, and cancellation messages only as authenticated encrypted frames
+- **AND** the remote relay MUST send response metadata, response chunks, response completion, and relay errors only as authenticated encrypted frames
+
+#### Scenario: Intermediary cannot read relay contents
+- **WHEN** an intermediary observes WebSocket frames for an E2EE relay session
+- **THEN** the intermediary MUST NOT be able to read request paths, forwarded headers, request bodies, response headers, response bodies, relay tokens, or relay error details from those frames without the session keys
+
+#### Scenario: Encrypted relay preserves existing semantics
+- **WHEN** a request is relayed through an E2EE session
+- **THEN** the system MUST preserve existing request chunking, reassembly validation, response streaming, cancellation, timeout, model mapping, and upstream forwarding behavior
+
+### Requirement: E2EE relay authentication
+The system SHALL authenticate encrypted relay sessions without exposing sensitive relay credentials in the outer WebSocket upgrade request when E2EE is required.
+
+#### Scenario: Valid encrypted relay authentication
+- **WHEN** E2EE is required and the local proxy sends valid relay authentication inside the encrypted session
+- **THEN** the remote relay MUST accept the session and allow request relay messages after authentication succeeds
+
+#### Scenario: Invalid encrypted relay authentication
+- **WHEN** E2EE is required and the local proxy sends missing or invalid relay authentication inside the encrypted session
+- **THEN** the remote relay MUST reject the session or close it before accepting request relay messages
+
+#### Scenario: Relay token is not sent in plaintext when E2EE is required
+- **WHEN** E2EE is required on the local proxy
+- **THEN** the local relay client MUST NOT send the relay token in the WebSocket upgrade `Authorization` header
+- **AND** it MUST send relay authentication only inside an authenticated encrypted frame
+
+#### Scenario: Unauthenticated encrypted session times out
+- **WHEN** a remote relay accepts a socket for an E2EE-required session and the client does not complete encrypted authentication within the allowed handshake window
+- **THEN** the remote relay MUST close the session without accepting request relay messages
+
+### Requirement: E2EE downgrade protection
+The system SHALL fail closed when E2EE is configured as required.
+
+#### Scenario: Required local E2EE cannot be established
+- **WHEN** the local proxy is configured with E2EE required and cannot complete an E2EE handshake with the remote relay
+- **THEN** the local proxy MUST fail the relay connection and MUST NOT send plaintext relay messages or plaintext relay authentication
+
+#### Scenario: Required remote E2EE receives plaintext relay message
+- **WHEN** the remote relay is configured with E2EE required and receives a plaintext relay request message before a successful E2EE handshake and encrypted authentication
+- **THEN** the remote relay MUST reject the message and close or fail the session
+
+#### Scenario: Required E2EE key mismatch
+- **WHEN** the local proxy and remote relay are configured with incompatible E2EE key material or unsupported encryption suites
+- **THEN** the relay session MUST fail before any request metadata or request body is relayed
+
+### Requirement: E2EE key configuration and rotation
+The system SHALL provide configuration for enabling relay E2EE and rotating E2EE keys.
+
+#### Scenario: Local E2EE key configuration is valid
+- **WHEN** the local proxy starts with E2EE enabled
+- **THEN** startup validation MUST require a valid E2EE mode, key id, and base64-encoded pre-shared key for the selected key id
+
+#### Scenario: Remote E2EE key configuration is valid
+- **WHEN** the remote relay starts with E2EE enabled
+- **THEN** startup validation MUST require a valid E2EE mode and at least one base64-encoded pre-shared key addressable by key id
+
+#### Scenario: Remote relay supports key rotation
+- **WHEN** the remote relay is configured with multiple E2EE keys and the local proxy presents a configured key id during handshake
+- **THEN** the remote relay MUST use the key material associated with that key id for session key derivation
+
+#### Scenario: E2EE configuration is invalid
+- **WHEN** E2EE is enabled and the configured mode, key id, key set, or key encoding is invalid
+- **THEN** startup validation MUST reject the configuration with a clear error

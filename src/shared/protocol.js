@@ -11,7 +11,11 @@ export const MESSAGE_TYPES = Object.freeze({
   ERROR: 'error',
   ACK: 'ack',
   PING: 'ping',
-  PONG: 'pong'
+  PONG: 'pong',
+  E2EE_CLIENT_HELLO: 'e2ee.client_hello',
+  E2EE_SERVER_HELLO: 'e2ee.server_hello',
+  E2EE_SESSION_AUTH: 'e2ee.session_auth',
+  SEALED: 'sealed'
 });
 
 const BINARY_CHUNK_TYPES = new Set([
@@ -116,6 +120,82 @@ export function decodeChunkMessage(data) {
   if (payload.length !== header.payloadBytes) {
     throw new ProtocolError('Binary relay frame payload length mismatch', {
       code: 'INVALID_FRAME_LENGTH'
+    });
+  }
+
+  return { header, payload };
+}
+
+export function encodeSealedFrame({ sessionId, seq }, payload) {
+  if (!sessionId) {
+    throw new ProtocolError('Sealed frame is missing session id', { code: 'MISSING_SESSION_ID' });
+  }
+  if (!Number.isSafeInteger(seq) || seq < 0) {
+    throw new ProtocolError('Sealed frame sequence must be a safe non-negative integer', {
+      code: 'INVALID_SEQUENCE'
+    });
+  }
+
+  const bytes = Buffer.from(payload);
+  const header = Buffer.from(
+    JSON.stringify({
+      version: PROTOCOL_VERSION,
+      type: MESSAGE_TYPES.SEALED,
+      sessionId,
+      seq,
+      ciphertextBytes: bytes.length
+    })
+  );
+  const frame = Buffer.allocUnsafe(4 + header.length + bytes.length);
+  frame.writeUInt32BE(header.length, 0);
+  header.copy(frame, 4);
+  bytes.copy(frame, 4 + header.length);
+  return frame;
+}
+
+export function decodeSealedFrame(data) {
+  const frame = Buffer.from(data);
+  if (frame.length < 4) {
+    throw new ProtocolError('Sealed frame is too short', { code: 'INVALID_SEALED_FRAME' });
+  }
+
+  const headerLength = frame.readUInt32BE(0);
+  if (headerLength <= 0 || headerLength > frame.length - 4) {
+    throw new ProtocolError('Sealed frame has invalid header length', {
+      code: 'INVALID_SEALED_FRAME_HEADER'
+    });
+  }
+
+  let header;
+  try {
+    header = JSON.parse(frame.subarray(4, 4 + headerLength).toString('utf8'));
+  } catch {
+    throw new ProtocolError('Sealed frame header is not valid JSON', {
+      code: 'INVALID_SEALED_FRAME_HEADER'
+    });
+  }
+
+  if (header.version !== PROTOCOL_VERSION) {
+    throw new ProtocolError('Unsupported sealed frame protocol version', {
+      code: 'UNSUPPORTED_VERSION'
+    });
+  }
+  if (header.type !== MESSAGE_TYPES.SEALED) {
+    throw new ProtocolError('Sealed frame has invalid message type', {
+      code: 'INVALID_SEALED_TYPE'
+    });
+  }
+  if (!header.sessionId) {
+    throw new ProtocolError('Sealed frame is missing session id', { code: 'MISSING_SESSION_ID' });
+  }
+  if (!Number.isSafeInteger(header.seq) || header.seq < 0) {
+    throw new ProtocolError('Sealed frame has invalid sequence', { code: 'INVALID_SEQUENCE' });
+  }
+
+  const payload = frame.subarray(4 + headerLength);
+  if (payload.length !== header.ciphertextBytes) {
+    throw new ProtocolError('Sealed frame payload length mismatch', {
+      code: 'INVALID_SEALED_FRAME_LENGTH'
     });
   }
 

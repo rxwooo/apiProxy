@@ -1,5 +1,12 @@
 import WebSocket from 'ws';
+import { HttpsProxyAgent } from 'https-proxy-agent';
 import { splitBuffer, sha256Hex, createRequestId } from '../shared/chunking.js';
+import {
+  E2EE_MODE_OFF,
+  createClientE2eeSession,
+  createClientHello
+} from '../shared/e2ee.js';
+import { getRelayProxyDiagnostics, getRelayProxyUrl } from '../shared/proxy.js';
 import {
   MESSAGE_TYPES,
   decodeChunkMessage,
@@ -9,11 +16,12 @@ import {
 } from '../shared/protocol.js';
 
 export class RelayUnavailableError extends Error {
-  constructor(message = 'Relay connection is unavailable') {
+  constructor(message = 'Relay connection is unavailable', metadata = {}) {
     super(message);
     this.name = 'RelayUnavailableError';
     this.code = 'RELAY_UNAVAILABLE';
     this.status = 502;
+    Object.assign(this, metadata);
   }
 }
 
@@ -36,11 +44,22 @@ export class RelayResponseError extends Error {
 }
 
 export class RelayClient {
-  constructor(config, { logger, WebSocketClass = WebSocket } = {}) {
+  constructor(
+    config,
+    {
+      logger,
+      WebSocketClass = WebSocket,
+      proxyAgentFactory = (proxyUrl) => new HttpsProxyAgent(proxyUrl)
+    } = {}
+  ) {
     this.config = config;
     this.logger = logger;
     this.WebSocketClass = WebSocketClass;
+    this.proxyDiagnostics = getRelayProxyDiagnostics(config);
+    this.proxyUrl = getRelayProxyUrl(config);
+    this.proxyAgent = this.proxyUrl ? proxyAgentFactory(this.proxyUrl) : undefined;
     this.ws = undefined;
+    this.e2eeSession = undefined;
     this.connectPromise = undefined;
     this.heartbeatTimer = undefined;
     this.pending = new Map();
@@ -140,32 +159,55 @@ export class RelayClient {
     if (this.connectPromise) return this.connectPromise;
 
     this.connectPromise = new Promise((resolve, reject) => {
-      const headers = this.config.relayToken
+      const useE2ee = this.#e2eeMode() !== E2EE_MODE_OFF;
+      const headers = !useE2ee && this.config.relayToken
         ? { authorization: `Bearer ${this.config.relayToken}` }
         : {};
-      const ws = new this.WebSocketClass(this.config.relayUrl, { headers });
+      const ws = new this.WebSocketClass(this.config.relayUrl, {
+        headers,
+        ...(this.proxyAgent ? { agent: this.proxyAgent } : {})
+      });
 
       const timeout = setTimeout(() => {
         ws.terminate();
-        reject(new RelayUnavailableError('Relay connection timed out'));
+        reject(this.#relayUnavailable('Relay connection timed out'));
       }, this.config.connectTimeoutMs);
 
       const rejectOnce = (error) => {
         clearTimeout(timeout);
-        reject(error instanceof Error ? error : new RelayUnavailableError(String(error)));
+        reject(
+          error instanceof RelayUnavailableError
+            ? error
+            : this.#relayUnavailable(error instanceof Error ? error.message : String(error))
+        );
       };
 
       ws.once('open', () => {
-        clearTimeout(timeout);
-        this.ws = ws;
-        this.#attachSocket(ws);
-        this.#startHeartbeat();
-        this.logger?.info('relay_connected', { relayUrl: this.config.relayUrl });
-        resolve(ws);
+        Promise.resolve()
+          .then(async () => {
+            this.e2eeSession = await this.#establishE2ee(ws);
+            clearTimeout(timeout);
+            this.ws = ws;
+            this.#attachSocket(ws);
+            this.#startHeartbeat();
+            this.logger?.info('relay_connected', {
+              relayUrl: this.config.relayUrl,
+              relayE2eeMode: this.#e2eeMode(),
+              relayE2eeEnabled: Boolean(this.e2eeSession),
+              ...this.proxyDiagnostics
+            });
+            resolve(ws);
+          })
+          .catch((error) => {
+            ws.terminate();
+            rejectOnce(error);
+          });
       });
       ws.once('error', rejectOnce);
       ws.once('close', (code, reason) => {
-        if (this.ws !== ws) rejectOnce(new RelayUnavailableError(`Relay closed: ${code} ${reason}`));
+        if (this.ws !== ws) {
+          rejectOnce(this.#relayUnavailable(`Relay closed: ${code} ${reason}`));
+        }
       });
     }).finally(() => {
       this.connectPromise = undefined;
@@ -189,16 +231,13 @@ export class RelayClient {
       });
     }
     this.ws = undefined;
+    this.e2eeSession = undefined;
   }
 
   #attachSocket(ws) {
     ws.on('message', (data, isBinary) => {
       try {
-        if (isBinary) {
-          this.#handleBinary(data);
-        } else {
-          this.#handleJson(decodeJsonMessage(data));
-        }
+        this.#handleFrame(data, isBinary);
       } catch (error) {
         this.logger?.warn('relay_message_error', {
           code: error.code,
@@ -208,20 +247,97 @@ export class RelayClient {
     });
 
     ws.on('close', (code, reason) => {
-      this.logger?.warn('relay_disconnected', { code, reason: reason.toString() });
+      this.logger?.warn('relay_disconnected', {
+        code,
+        reason: reason.toString(),
+        ...this.proxyDiagnostics
+      });
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = undefined;
-      if (this.ws === ws) this.ws = undefined;
+      if (this.ws === ws) {
+        this.ws = undefined;
+        this.e2eeSession = undefined;
+      }
       for (const pending of this.pending.values()) {
         clearTimeout(pending.timeout);
-        pending.reject(new RelayUnavailableError('Relay connection closed'));
+        pending.reject(this.#relayUnavailable('Relay connection closed'));
       }
       this.pending.clear();
     });
 
     ws.on('error', (error) => {
-      this.logger?.warn('relay_socket_error', { message: error.message });
+      this.logger?.warn('relay_socket_error', {
+        message: error.message,
+        ...this.proxyDiagnostics
+      });
     });
+  }
+
+  #relayUnavailable(message) {
+    return new RelayUnavailableError(message, this.proxyDiagnostics);
+  }
+
+  #e2eeMode() {
+    return this.config.relayE2eeMode ?? E2EE_MODE_OFF;
+  }
+
+  async #establishE2ee(ws) {
+    if (this.#e2eeMode() === E2EE_MODE_OFF) return undefined;
+    if (!this.config.relayE2eeKeyId || !this.config.relayE2eePsk) {
+      throw this.#relayUnavailable('Relay E2EE is enabled but key configuration is incomplete');
+    }
+
+    const { clientNonce, message } = createClientHello({
+      keyId: this.config.relayE2eeKeyId
+    });
+    await sendWsRaw(ws, encodeJsonMessage(message));
+
+    const serverHelloFrame = await readWsMessage(ws);
+    if (serverHelloFrame.isBinary) {
+      throw this.#relayUnavailable('Relay E2EE handshake returned an unexpected binary frame');
+    }
+
+    const serverHello = decodeJsonMessage(serverHelloFrame.data);
+    if (serverHello.type === MESSAGE_TYPES.ERROR) {
+      throw this.#relayUnavailable(serverHello.message ?? 'Relay E2EE handshake failed');
+    }
+    if (serverHello.type !== MESSAGE_TYPES.E2EE_SERVER_HELLO) {
+      throw this.#relayUnavailable('Relay did not complete the E2EE handshake');
+    }
+
+    const session = createClientE2eeSession({
+      keyId: this.config.relayE2eeKeyId,
+      psk: this.config.relayE2eePsk,
+      clientNonce,
+      serverHello
+    });
+
+    await sendWsRaw(
+      ws,
+      session.seal(
+        encodeJsonMessage({
+          type: MESSAGE_TYPES.E2EE_SESSION_AUTH,
+          relayToken: this.config.relayToken ?? '',
+          keyId: this.config.relayE2eeKeyId,
+          mode: this.#e2eeMode()
+        })
+      ),
+      { binary: true }
+    );
+
+    const ackFrame = await readWsMessage(ws);
+    if (!ackFrame.isBinary) {
+      throw this.#relayUnavailable('Relay E2EE authentication returned plaintext');
+    }
+    const ack = decodeJsonMessage(session.open(ackFrame.data));
+    if (ack.type === MESSAGE_TYPES.ERROR) {
+      throw this.#relayUnavailable(ack.message ?? 'Relay E2EE authentication failed');
+    }
+    if (ack.type !== MESSAGE_TYPES.ACK) {
+      throw this.#relayUnavailable('Relay E2EE authentication did not acknowledge the session');
+    }
+
+    return session;
   }
 
   #startHeartbeat() {
@@ -273,6 +389,30 @@ export class RelayClient {
     }
 
     if (message.type === MESSAGE_TYPES.PONG || message.type === MESSAGE_TYPES.ACK) return;
+  }
+
+  #handleFrame(data, isBinary) {
+    if (this.e2eeSession) {
+      if (!isBinary) {
+        throw new RelayResponseError('Encrypted relay session received plaintext frame', {
+          code: 'E2EE_PLAINTEXT_FRAME',
+          status: 502
+        });
+      }
+      const plaintext = this.e2eeSession.open(data);
+      if (isJsonFrame(plaintext)) {
+        this.#handleJson(decodeJsonMessage(plaintext));
+      } else {
+        this.#handleBinary(plaintext);
+      }
+      return;
+    }
+
+    if (isBinary) {
+      this.#handleBinary(data);
+    } else {
+      this.#handleJson(decodeJsonMessage(data));
+    }
   }
 
   #handleBinary(data) {
@@ -327,11 +467,52 @@ export class RelayClient {
       throw new RelayUnavailableError();
     }
 
+    const payload = this.e2eeSession ? this.e2eeSession.seal(data) : data;
+    const sendOptions = this.e2eeSession ? { binary: true } : options;
     await new Promise((resolve, reject) => {
-      ws.send(data, options, (error) => {
+      ws.send(payload, sendOptions, (error) => {
         if (error) reject(error);
         else resolve();
       });
     });
   }
+}
+
+function isJsonFrame(data) {
+  const buffer = Buffer.from(data);
+  return buffer.length > 0 && buffer[0] === 0x7b;
+}
+
+async function sendWsRaw(ws, data, options = {}) {
+  await new Promise((resolve, reject) => {
+    ws.send(data, options, (error) => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
+}
+
+async function readWsMessage(ws) {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      ws.off('message', onMessage);
+      ws.off('close', onClose);
+      ws.off('error', onError);
+    };
+    const onMessage = (data, isBinary) => {
+      cleanup();
+      resolve({ data, isBinary });
+    };
+    const onClose = (code, reason) => {
+      cleanup();
+      reject(new Error(`Relay closed during E2EE handshake: ${code} ${reason}`));
+    };
+    const onError = (error) => {
+      cleanup();
+      reject(error);
+    };
+    ws.once('message', onMessage);
+    ws.once('close', onClose);
+    ws.once('error', onError);
+  });
 }

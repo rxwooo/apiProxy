@@ -1,6 +1,13 @@
 import { createServer } from 'node:http';
 import { WebSocketServer } from 'ws';
 import { splitBuffer } from '../shared/chunking.js';
+import {
+  E2EE_HANDSHAKE_TIMEOUT_MS,
+  E2EE_MODE_OFF,
+  E2EE_MODE_REQUIRED,
+  createServerE2eeSession,
+  createServerHello
+} from '../shared/e2ee.js';
 import { filterResponseHeaders, isStreamingHeaders, sendJson } from '../shared/http.js';
 import { createLogger } from '../shared/logger.js';
 import {
@@ -36,10 +43,20 @@ export function createRemoteRelayServer(config, { logger = createLogger({ name: 
       rejectUpgrade(socket, 404, 'Not Found');
       return;
     }
-    if (!isAuthorized(request.headers.authorization, config.relayToken)) {
+
+    const mode = relayE2eeMode(config);
+    const preauthorized = isAuthorized(request.headers.authorization, config.relayToken);
+    if (mode === E2EE_MODE_OFF && !preauthorized) {
       rejectUpgrade(socket, 401, 'Unauthorized');
       return;
     }
+    if (mode !== E2EE_MODE_OFF && request.headers.authorization && !preauthorized) {
+      rejectUpgrade(socket, 401, 'Unauthorized');
+      return;
+    }
+    request.relaySession = {
+      preauthorized: mode !== E2EE_MODE_REQUIRED && preauthorized
+    };
 
     wss.handleUpgrade(request, socket, head, (ws) => {
       wss.emit('connection', ws, request);
@@ -62,19 +79,40 @@ function handleSession(ws, request, config, logger, fetchImpl) {
   });
   const activeUpstream = new Map();
   const heartbeat = attachHeartbeat(ws, config.heartbeatIntervalMs);
+  const session = {
+    authenticated: Boolean(request.relaySession?.preauthorized),
+    e2ee: undefined,
+    e2eeMode: relayE2eeMode(config),
+    handshakeTimer: undefined
+  };
+
+  if (!session.authenticated && session.e2eeMode !== E2EE_MODE_OFF) {
+    session.handshakeTimer = setTimeout(() => {
+      ws.close(1008, 'E2EE authentication timeout');
+    }, config.relayE2eeHandshakeTimeoutMs ?? E2EE_HANDSHAKE_TIMEOUT_MS);
+    session.handshakeTimer.unref?.();
+  }
 
   logger.info('relay_session_open', {
-    remoteAddress: request.socket.remoteAddress
+    remoteAddress: request.socket.remoteAddress,
+    relayE2eeMode: session.e2eeMode,
+    relayE2eeAuthenticated: session.authenticated
   });
 
   ws.on('message', (data, isBinary) => {
     Promise.resolve()
       .then(async () => {
-        if (isBinary) {
-          await handleBinaryMessage(ws, reassembler, data);
-        } else {
-          await handleJsonMessage(ws, reassembler, activeUpstream, config, logger, fetchImpl, data);
-        }
+        await handleSessionFrame(
+          ws,
+          session,
+          reassembler,
+          activeUpstream,
+          config,
+          logger,
+          fetchImpl,
+          data,
+          isBinary
+        );
       })
       .catch((error) => {
         logger.warn('relay_session_message_failed', {
@@ -83,16 +121,21 @@ function handleSession(ws, request, config, logger, fetchImpl) {
           message: error.message
         });
         sendError(ws, {
+          session,
           id: error.id,
           code: error.code ?? 'RELAY_ERROR',
           message: error.message,
           status: error.status ?? 400
         });
+        if (!session.authenticated || String(error.code ?? '').startsWith('E2EE_')) {
+          ws.close(1008, error.code ?? 'RELAY_ERROR');
+        }
       });
   });
 
   ws.on('close', (code, reason) => {
     clearInterval(heartbeat);
+    clearTimeout(session.handshakeTimer);
     reassembler.abortAll();
     for (const entry of activeUpstream.values()) {
       entry.cancelled = true;
@@ -107,8 +150,126 @@ function handleSession(ws, request, config, logger, fetchImpl) {
   });
 }
 
-async function handleJsonMessage(ws, reassembler, activeUpstream, config, logger, fetchImpl, data) {
+async function handleSessionFrame(
+  ws,
+  session,
+  reassembler,
+  activeUpstream,
+  config,
+  logger,
+  fetchImpl,
+  data,
+  isBinary
+) {
+  if (!session.e2ee && !session.authenticated) {
+    await handleUnauthenticatedFrame(ws, session, config, logger, data, isBinary);
+    return;
+  }
+
+  if (session.e2ee) {
+    if (!isBinary) {
+      await failSession(ws, session, {
+        code: 'E2EE_PLAINTEXT_FRAME',
+        message: 'Encrypted relay session received plaintext frame',
+        status: 400
+      });
+      return;
+    }
+    const plaintext = session.e2ee.open(data);
+    if (isJsonFrame(plaintext)) {
+      await handleJsonMessage(
+        ws,
+        session,
+        reassembler,
+        activeUpstream,
+        config,
+        logger,
+        fetchImpl,
+        plaintext
+      );
+    } else {
+      await handleBinaryMessage(ws, reassembler, plaintext);
+    }
+    return;
+  }
+
+  if (isBinary) {
+    await handleBinaryMessage(ws, reassembler, data);
+  } else {
+    await handleJsonMessage(ws, session, reassembler, activeUpstream, config, logger, fetchImpl, data);
+  }
+}
+
+async function handleUnauthenticatedFrame(ws, session, config, logger, data, isBinary) {
+  if (session.e2eeMode === E2EE_MODE_OFF) {
+    await failSession(ws, session, {
+      code: 'UNAUTHORIZED',
+      message: 'Relay session is not authorized',
+      status: 401
+    });
+    return;
+  }
+  if (isBinary) {
+    await failSession(ws, session, {
+      code: 'E2EE_HANDSHAKE_REQUIRED',
+      message: 'E2EE handshake is required before binary relay messages',
+      status: 401
+    });
+    return;
+  }
+
   const message = decodeJsonMessage(data);
+  if (message.type !== MESSAGE_TYPES.E2EE_CLIENT_HELLO) {
+    await failSession(ws, session, {
+      code: 'E2EE_HANDSHAKE_REQUIRED',
+      message: 'E2EE handshake is required before relay messages',
+      status: 401
+    });
+    return;
+  }
+
+  const psk = config.relayE2eeKeys?.get(message.keyId);
+  if (!psk) {
+    await failSession(ws, session, {
+      code: 'E2EE_UNKNOWN_KEY',
+      message: 'Unknown E2EE key id',
+      status: 401
+    });
+    return;
+  }
+
+  const { serverNonce, sessionId, suite, message: serverHello } = createServerHello({
+    clientHello: message
+  });
+  session.e2ee = createServerE2eeSession({
+    keyId: message.keyId,
+    psk,
+    clientNonce: message.clientNonce,
+    serverNonce,
+    sessionId,
+    suite
+  });
+  session.e2eeKeyId = message.keyId;
+  await sendPlainRaw(ws, encodeJsonMessage(serverHello));
+  logger.info('relay_e2ee_handshake_started', { keyId: message.keyId });
+}
+
+async function handleJsonMessage(ws, session, reassembler, activeUpstream, config, logger, fetchImpl, data) {
+  const message = decodeJsonMessage(data);
+
+  if (message.type === MESSAGE_TYPES.E2EE_SESSION_AUTH) {
+    await handleEncryptedAuth(ws, session, config, logger, message);
+    return;
+  }
+
+  if (!session.authenticated) {
+    await failSession(ws, session, {
+      code: 'UNAUTHORIZED',
+      message: 'Relay session is not authenticated',
+      status: 401
+    });
+    return;
+  }
 
   if (message.type === MESSAGE_TYPES.REQUEST_START) {
     try {
@@ -138,8 +299,9 @@ async function handleJsonMessage(ws, reassembler, activeUpstream, config, logger
       error.id = message.id;
       throw error;
     }
-    forwardUpstream(ws, activeUpstream, config, logger, fetchImpl, complete).catch((error) => {
+    forwardUpstream(ws, session, activeUpstream, config, logger, fetchImpl, complete).catch((error) => {
       sendError(ws, {
+        session,
         id: message.id,
         code: error.code ?? 'UPSTREAM_ERROR',
         message: error.message,
@@ -165,8 +327,37 @@ async function handleJsonMessage(ws, reassembler, activeUpstream, config, logger
   }
 
   if (message.type === MESSAGE_TYPES.PING) {
-    await sendJsonMessage(ws, { type: MESSAGE_TYPES.PONG });
+    await sendJsonMessage(ws, session, { type: MESSAGE_TYPES.PONG });
   }
+}
+
+async function handleEncryptedAuth(ws, session, config, logger, message) {
+  if (!session.e2ee) {
+    await failSession(ws, session, {
+      code: 'E2EE_HANDSHAKE_REQUIRED',
+      message: 'E2EE authentication requires a completed handshake',
+      status: 401
+    });
+    return;
+  }
+
+  if (!isAuthorized(message.relayToken ? `Bearer ${message.relayToken}` : '', config.relayToken)) {
+    await failSession(ws, session, {
+      code: 'UNAUTHORIZED',
+      message: 'Invalid relay authentication',
+      status: 401
+    });
+    return;
+  }
+
+  session.authenticated = true;
+  clearTimeout(session.handshakeTimer);
+  session.handshakeTimer = undefined;
+  await sendJsonMessage(ws, session, { type: MESSAGE_TYPES.ACK });
+  logger.info('relay_e2ee_session_authenticated', {
+    keyId: session.e2eeKeyId,
+    relayE2eeMode: session.e2eeMode
+  });
 }
 
 async function handleBinaryMessage(ws, reassembler, data) {
@@ -180,7 +371,7 @@ async function handleBinaryMessage(ws, reassembler, data) {
   }
 }
 
-async function forwardUpstream(ws, activeUpstream, config, logger, fetchImpl, { metadata, body }) {
+async function forwardUpstream(ws, session, activeUpstream, config, logger, fetchImpl, { metadata, body }) {
   const startedAt = Date.now();
   const controller = new AbortController();
   const active = { controller, cancelled: false };
@@ -204,7 +395,7 @@ async function forwardUpstream(ws, activeUpstream, config, logger, fetchImpl, { 
 
     const responseHeaders = filterResponseHeaders(response.headers);
     const stream = Boolean(metadata.stream) || isStreamingHeaders(responseHeaders);
-    await sendJsonMessage(ws, {
+    await sendJsonMessage(ws, session, {
       type: MESSAGE_TYPES.RESPONSE_START,
       id: metadata.id,
       status: response.status,
@@ -223,18 +414,18 @@ async function forwardUpstream(ws, activeUpstream, config, logger, fetchImpl, { 
           responseBytes += buffer.length;
           assertResponseSize(responseBytes, config.maxResponseBytes);
           for (const mappedPart of mapper.push(buffer)) {
-            seq = await sendChunkedResponsePart(ws, metadata.id, seq, mappedPart, config.chunkSize);
+            seq = await sendChunkedResponsePart(ws, session, metadata.id, seq, mappedPart, config.chunkSize);
           }
         }
         for (const mappedPart of mapper.flush()) {
-          seq = await sendChunkedResponsePart(ws, metadata.id, seq, mappedPart, config.chunkSize);
+          seq = await sendChunkedResponsePart(ws, session, metadata.id, seq, mappedPart, config.chunkSize);
         }
       } else if (stream) {
         for await (const chunk of response.body) {
           const buffer = Buffer.from(chunk);
           responseBytes += buffer.length;
           assertResponseSize(responseBytes, config.maxResponseBytes);
-          seq = await sendChunkedResponsePart(ws, metadata.id, seq, buffer, config.chunkSize);
+          seq = await sendChunkedResponsePart(ws, session, metadata.id, seq, buffer, config.chunkSize);
         }
       } else {
         const upstreamBody = await readUpstreamBody(response.body, config.maxResponseBytes);
@@ -242,6 +433,7 @@ async function forwardUpstream(ws, activeUpstream, config, logger, fetchImpl, { 
         responseBytes = mappedResponse.body.length;
         seq = await sendChunkedResponsePart(
           ws,
+          session,
           metadata.id,
           seq,
           mappedResponse.body,
@@ -250,7 +442,7 @@ async function forwardUpstream(ws, activeUpstream, config, logger, fetchImpl, { 
       }
     }
 
-    await sendJsonMessage(ws, { type: MESSAGE_TYPES.RESPONSE_END, id: metadata.id });
+    await sendJsonMessage(ws, session, { type: MESSAGE_TYPES.RESPONSE_END, id: metadata.id });
     logger.info('relay_request_complete', {
       requestId: metadata.id,
       method: metadata.method,
@@ -266,6 +458,7 @@ async function forwardUpstream(ws, activeUpstream, config, logger, fetchImpl, { 
   } catch (error) {
     if (active.cancelled) {
       await sendError(ws, {
+        session,
         id: metadata.id,
         code: 'CANCELLED',
         message: 'Request was cancelled',
@@ -275,6 +468,7 @@ async function forwardUpstream(ws, activeUpstream, config, logger, fetchImpl, { 
     }
     if (timedOut) {
       await sendError(ws, {
+        session,
         id: metadata.id,
         code: 'UPSTREAM_TIMEOUT',
         message: 'Upstream request timed out',
@@ -301,10 +495,11 @@ async function readUpstreamBody(body, maxResponseBytes) {
   return Buffer.concat(chunks, responseBytes);
 }
 
-async function sendChunkedResponsePart(ws, id, seq, buffer, chunkSize) {
+async function sendChunkedResponsePart(ws, session, id, seq, buffer, chunkSize) {
   for (const part of splitBuffer(buffer, chunkSize)) {
     await sendBinaryMessage(
       ws,
+      session,
       encodeChunkMessage({ type: MESSAGE_TYPES.RESPONSE_CHUNK, id, seq }, part)
     );
     seq += 1;
@@ -390,23 +585,44 @@ function attachHeartbeat(ws, intervalMs) {
   return timer;
 }
 
-async function sendJsonMessage(ws, message) {
-  return sendRaw(ws, encodeJsonMessage(message));
+function relayE2eeMode(config) {
+  return config.relayE2eeMode ?? E2EE_MODE_OFF;
 }
 
-async function sendBinaryMessage(ws, frame) {
-  return sendRaw(ws, frame, { binary: true });
+function isJsonFrame(data) {
+  const buffer = Buffer.from(data);
+  return buffer.length > 0 && buffer[0] === 0x7b;
 }
 
-async function sendError(ws, { id, code, message, status }) {
+async function failSession(ws, session, { code, message, status }) {
+  await sendError(ws, { session, code, message, status });
+  ws.close(1008, code);
+}
+
+async function sendJsonMessage(ws, session, message) {
+  return sendRaw(ws, session, encodeJsonMessage(message));
+}
+
+async function sendBinaryMessage(ws, session, frame) {
+  return sendRaw(ws, session, frame, { binary: true });
+}
+
+async function sendError(ws, { session, id, code, message, status }) {
   try {
-    await sendJsonMessage(ws, errorMessage({ id, code, message, status }));
+    await sendJsonMessage(ws, session, errorMessage({ id, code, message, status }));
   } catch {
     // The socket may already be gone; request cleanup is handled by callers.
   }
 }
 
-async function sendRaw(ws, data, options = {}) {
+async function sendRaw(ws, session, data, options = {}) {
+  if (session?.e2ee) {
+    return sendPlainRaw(ws, session.e2ee.seal(data), { binary: true });
+  }
+  return sendPlainRaw(ws, data, options);
+}
+
+async function sendPlainRaw(ws, data, options = {}) {
   if (ws.readyState !== 1) return;
   await new Promise((resolve, reject) => {
     ws.send(data, options, (error) => {

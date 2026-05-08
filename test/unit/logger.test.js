@@ -13,12 +13,18 @@ test('redact hides credentials and prompt-bearing fields', () => {
     redact({
       authorization: 'Bearer secret',
       relayToken: 'secret',
+      relayProxy: 'http://user:secret@127.0.0.1:7890',
+      proxyUrl: 'http://user:secret@127.0.0.1:7890',
+      relayProxyHost: '127.0.0.1:7890',
       messages: [{ role: 'user', content: 'private prompt' }],
       body: '{"secret":true}'
     }),
     {
       authorization: '[redacted]',
       relayToken: '[redacted]',
+      relayProxy: '[redacted]',
+      proxyUrl: '[redacted]',
+      relayProxyHost: '127.0.0.1:7890',
       messages: '[redacted]',
       body: '[redacted]'
     }

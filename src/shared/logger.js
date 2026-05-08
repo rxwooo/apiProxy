@@ -9,13 +9,18 @@ const LEVELS = {
 const SENSITIVE_KEY_PATTERN =
   /authorization|api[-_]?key|token|secret|password|credential|cookie|body|prompt|messages|content/i;
 
+function isSensitiveKey(key) {
+  const normalized = key.toLowerCase().replace(/[-_]/g, '');
+  return SENSITIVE_KEY_PATTERN.test(key) || normalized === 'relayproxy' || normalized.endsWith('proxyurl');
+}
+
 export function redact(value) {
   if (Array.isArray(value)) return value.map((item) => redact(item));
   if (!value || typeof value !== 'object') return value;
 
   const redacted = {};
   for (const [key, child] of Object.entries(value)) {
-    if (SENSITIVE_KEY_PATTERN.test(key)) {
+    if (isSensitiveKey(key)) {
       redacted[key] = '[redacted]';
     } else {
       redacted[key] = redact(child);
