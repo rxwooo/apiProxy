@@ -1,6 +1,6 @@
 # API Proxy WSS Relay
 
-This project provides a local OpenAI-compatible HTTP proxy that tunnels requests to a remote relay over WebSocket Secure. It is intended for environments where normal outbound HTTP requests are size-limited, while WSS traffic can carry chunked payloads.
+This project provides a local OpenAI-compatible and Anthropic-compatible HTTP proxy that tunnels requests to a remote relay over WebSocket Secure. It is intended for environments where normal outbound HTTP requests are size-limited, while WSS traffic can carry chunked payloads.
 
 ```text
 Agent -> Local Proxy -> WSS chunks -> Remote Relay -> Third-party model API
@@ -13,9 +13,11 @@ Agent -> Local Proxy -> WSS chunks -> Remote Relay -> Third-party model API
 - WSS payload chunks default to `8192` bytes.
 - Provider API credentials are applied by the remote relay, not by the agent.
 
-Supported first-version endpoints:
+Supported endpoints:
 
 - `POST /v1/chat/completions`
+- `POST /v1/messages`
+- `POST /v1/messages/count_tokens`
 - `GET /v1/models`
 - `GET /healthz`
 
@@ -65,18 +67,63 @@ Remote relay variables:
 - `RELAY_E2EE`: application-layer relay encryption mode: `off`, `optional`, or `required`.
 - `RELAY_E2EE_KEY_ID` and `RELAY_E2EE_PSK_B64`: single-key E2EE configuration for simple deployments.
 - `RELAY_E2EE_KEYS_JSON`: optional JSON object mapping E2EE key ids to base64-encoded keys for rotation, for example `{"main":"..."}`.
-- `UPSTREAM_BASE_URL`: upstream model API base URL.
-- `UPSTREAM_API_KEY`: upstream provider API key.
-- `UPSTREAM_AUTH_SCHEME`: upstream auth scheme. Defaults to `Bearer`.
+- `UPSTREAM_ROUTING`: upstream routing mode: `single` or `auto`. Defaults to `single` for compatibility.
+- `UPSTREAM_PROVIDER`: provider used by `single` routing and by `auto` routing for ambiguous requests such as `GET /v1/models` without a provider query. Defaults to `openai`.
+- `UPSTREAM_BASE_URL`, `UPSTREAM_API_KEY`, `UPSTREAM_AUTH_SCHEME`: compatibility aliases for single-provider deployments.
+- `OPENAI_BASE_URL`: OpenAI upstream base URL. Defaults to `https://api.openai.com`.
+- `OPENAI_API_KEY`: OpenAI upstream API key.
+- `OPENAI_AUTH_SCHEME`: OpenAI upstream auth scheme. Defaults to `Bearer`.
+- `ANTHROPIC_BASE_URL`: Anthropic upstream base URL. Defaults to `https://api.anthropic.com`.
+- `ANTHROPIC_API_KEY`: Anthropic upstream API key.
+- `ANTHROPIC_VERSION`: required Anthropic API version when Anthropic can be selected.
+- `ANTHROPIC_BETA`: optional Anthropic beta header value forwarded by the remote relay when Anthropic is selected.
 - `MODEL_ID_MAP`: optional JSON object mapping client-facing model aliases to upstream model ids.
 
-Example:
+Single-provider OpenAI example:
 
 ```env
+UPSTREAM_ROUTING=single
+UPSTREAM_PROVIDER=openai
+UPSTREAM_BASE_URL=https://api.openai.com
+UPSTREAM_API_KEY=sk-...
+UPSTREAM_AUTH_SCHEME=Bearer
 MODEL_ID_MAP={"A":"provider-real-model-id","fast":"provider-fast-model-id"}
 ```
 
 With that configuration, the client can send `"model":"A"` and the remote relay will forward `"model":"provider-real-model-id"` to the upstream API. If the upstream JSON or SSE response includes `"model":"provider-real-model-id"`, the relay rewrites it back to `"model":"A"` before returning it to the client.
+
+Single-provider Anthropic example:
+
+```env
+UPSTREAM_ROUTING=single
+UPSTREAM_PROVIDER=anthropic
+UPSTREAM_API_KEY=sk-ant-...
+ANTHROPIC_VERSION=2023-06-01
+# ANTHROPIC_BETA=some-beta-name
+```
+
+When `UPSTREAM_PROVIDER=anthropic`, the remote relay applies `x-api-key` and `anthropic-version` upstream. Client-supplied `Authorization` and `x-api-key` headers are stripped at the local proxy boundary, and client-supplied `anthropic-version` cannot override the remote relay configuration.
+
+Automatic routing example:
+
+```env
+UPSTREAM_ROUTING=auto
+UPSTREAM_PROVIDER=openai
+OPENAI_BASE_URL=https://api.openai.com
+OPENAI_API_KEY=sk-...
+OPENAI_AUTH_SCHEME=Bearer
+ANTHROPIC_BASE_URL=https://api.anthropic.com
+ANTHROPIC_API_KEY=sk-ant-...
+ANTHROPIC_VERSION=2023-06-01
+```
+
+With `UPSTREAM_ROUTING=auto`, the remote relay selects the upstream provider per request:
+
+- `POST /v1/chat/completions` routes to OpenAI.
+- `POST /v1/messages` and `POST /v1/messages/count_tokens` route to Anthropic.
+- `GET /v1/models?provider=openai` routes to OpenAI and forwards upstream as `GET /v1/models`.
+- `GET /v1/models?provider=anthropic` routes to Anthropic and forwards upstream as `GET /v1/models`.
+- `GET /v1/models` without `provider` routes to `UPSTREAM_PROVIDER`.
 
 Shared variables:
 
@@ -92,9 +139,11 @@ Shared variables:
 Production startup validation requires:
 
 - `RELAY_TOKEN`
-- `UPSTREAM_API_KEY` on the remote relay
+- the selected provider API key on the remote relay
+- `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` when `UPSTREAM_ROUTING=auto`
+- `ANTHROPIC_VERSION` on the remote relay when Anthropic can be selected
 - `RELAY_URL` using `wss://` on the local proxy
-- `UPSTREAM_BASE_URL` using `https://` on the remote relay
+- selected upstream base URLs using `https://` on the remote relay
 - local proxy bound to loopback unless `ALLOW_PUBLIC_LOCAL_PROXY=true`
 
 ## Relay E2EE
@@ -171,6 +220,42 @@ curl -N http://127.0.0.1:8787/v1/chat/completions \
   -d '{"model":"your-upstream-model","stream":true,"messages":[{"role":"user","content":"hello"}]}'
 ```
 
+For native Anthropic Messages API pass-through, configure the remote relay with either `UPSTREAM_ROUTING=auto` and `ANTHROPIC_API_KEY`, or single-provider `UPSTREAM_PROVIDER=anthropic`, then point an Anthropic-compatible client at the local proxy base URL:
+
+```text
+ANTHROPIC_BASE_URL=http://127.0.0.1:8787
+ANTHROPIC_API_KEY=unused-by-local-proxy
+```
+
+Example non-streaming request:
+
+```bash
+curl http://127.0.0.1:8787/v1/messages \
+  -H 'content-type: application/json' \
+  -H 'x-api-key: unused-by-local-proxy' \
+  -H 'anthropic-version: 2023-06-01' \
+  -d '{"model":"your-upstream-model","max_tokens":64,"messages":[{"role":"user","content":"hello"}]}'
+```
+
+For native Anthropic streaming:
+
+```bash
+curl -N http://127.0.0.1:8787/v1/messages \
+  -H 'content-type: application/json' \
+  -H 'x-api-key: unused-by-local-proxy' \
+  -H 'anthropic-version: 2023-06-01' \
+  -d '{"model":"your-upstream-model","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hello"}]}'
+```
+
+The first Anthropic phase is native pass-through only. The proxy does not translate OpenAI `/v1/chat/completions` requests into Anthropic `/v1/messages` requests, and it does not translate Anthropic responses or SSE events into OpenAI response schemas.
+
+When automatic routing is enabled, use the native request path to select the provider. For model lists, add a provider query when the client needs a specific upstream:
+
+```bash
+curl http://127.0.0.1:8787/v1/models?provider=anthropic
+curl http://127.0.0.1:8787/v1/models?provider=openai
+```
+
 ## Windows Proxy Checks
 
 Check whether direct access to the remote relay works:
@@ -209,7 +294,7 @@ HTTP/1.1 101 Switching Protocols
 npm test
 ```
 
-The test suite covers chunking and digest validation, request reassembly, large requests over the relay path, non-streaming and streaming responses, cancellation, relay disconnects, invalid auth, upstream errors, timeouts, and digest mismatch handling.
+The test suite covers chunking and digest validation, request reassembly, large requests over the relay path, OpenAI and Anthropic non-streaming and streaming responses, cancellation, relay disconnects, invalid auth, upstream errors, timeouts, and digest mismatch handling.
 
 ## Security Notes
 

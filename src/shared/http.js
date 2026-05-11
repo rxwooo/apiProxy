@@ -11,7 +11,7 @@ const HOP_BY_HOP_HEADERS = new Set([
   'upgrade'
 ]);
 
-const SENSITIVE_FORWARD_HEADERS = new Set(['authorization', 'cookie', 'set-cookie']);
+const SENSITIVE_FORWARD_HEADERS = new Set(['authorization', 'cookie', 'set-cookie', 'x-api-key']);
 
 export async function readRequestBody(request, { maxBytes }) {
   const chunks = [];

@@ -11,6 +11,8 @@ server.listen(config.port, config.host, () => {
     host: config.host,
     port: config.port,
     relayPath: config.relayPath,
+    upstreamRouting: config.upstreamRouting,
+    upstreamProvider: config.upstreamProvider,
     upstreamBaseUrl: config.upstreamBaseUrl
   });
 });

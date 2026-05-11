@@ -2,6 +2,11 @@ import { createServer } from 'node:http';
 import { WebSocketServer } from 'ws';
 import { splitBuffer } from '../shared/chunking.js';
 import {
+  UPSTREAM_ROUTING_AUTO,
+  UPSTREAM_PROVIDER_ANTHROPIC,
+  UPSTREAM_PROVIDER_OPENAI
+} from '../shared/config.js';
+import {
   E2EE_HANDSHAKE_TIMEOUT_MS,
   E2EE_MODE_OFF,
   E2EE_MODE_REQUIRED,
@@ -384,11 +389,11 @@ async function forwardUpstream(ws, session, activeUpstream, config, logger, fetc
   }, config.requestTimeoutMs);
 
   try {
-    const upstreamUrl = buildUpstreamUrl(config.upstreamBaseUrl, metadata.path);
+    const upstreamRoute = selectUpstreamRoute(config, metadata);
     const mappedRequest = applyModelIdMap(body, config.modelIdMap);
-    const response = await fetchImpl(upstreamUrl, {
+    const response = await fetchImpl(upstreamRoute.url, {
       method: metadata.method,
-      headers: buildUpstreamHeaders(metadata.headers, config),
+      headers: buildProviderUpstreamHeaders(metadata.headers, upstreamRoute.upstream),
       body: allowsBody(metadata.method) ? mappedRequest.body : undefined,
       signal: controller.signal
     });
@@ -447,6 +452,7 @@ async function forwardUpstream(ws, session, activeUpstream, config, logger, fetc
       requestId: metadata.id,
       method: metadata.method,
       path: metadata.path,
+      upstreamProvider: upstreamRoute.provider,
       upstreamStatus: response.status,
       durationMs: Date.now() - startedAt,
       requestBytes: body.length,
@@ -534,21 +540,106 @@ function normalizeRequestMetadata(message) {
   };
 }
 
-function buildUpstreamUrl(baseUrl, requestPath) {
-  return new URL(requestPath, baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`).toString();
+function selectUpstreamRoute(config, metadata) {
+  const route = resolveUpstreamRoute(config, metadata.path);
+  const upstream = getUpstreamConfig(config, route.provider);
+  return {
+    ...route,
+    upstream,
+    url: buildProviderUpstreamUrl(upstream, route.upstreamPath)
+  };
 }
 
-function buildUpstreamHeaders(headers, config) {
+function resolveUpstreamRoute(config, requestPath) {
+  if ((config.upstreamRouting ?? 'single') !== UPSTREAM_ROUTING_AUTO) {
+    return {
+      provider: upstreamProvider(config),
+      upstreamPath: requestPath
+    };
+  }
+
+  const url = new URL(requestPath, 'http://relay.local');
+  if (url.pathname === '/v1/chat/completions') {
+    return { provider: UPSTREAM_PROVIDER_OPENAI, upstreamPath: `${url.pathname}${url.search}` };
+  }
+  if (url.pathname === '/v1/messages' || url.pathname === '/v1/messages/count_tokens') {
+    return { provider: UPSTREAM_PROVIDER_ANTHROPIC, upstreamPath: `${url.pathname}${url.search}` };
+  }
+  if (url.pathname === '/v1/models') {
+    const requestedProvider = url.searchParams.get('provider');
+    const provider = requestedProvider ? parseRouteProvider(requestedProvider) : upstreamProvider(config);
+    url.searchParams.delete('provider');
+    return {
+      provider,
+      upstreamPath: `${url.pathname}${url.search}`
+    };
+  }
+
+  return {
+    provider: upstreamProvider(config),
+    upstreamPath: requestPath
+  };
+}
+
+function parseRouteProvider(value) {
+  const provider = String(value ?? '').trim().toLowerCase();
+  if (provider === UPSTREAM_PROVIDER_OPENAI || provider === UPSTREAM_PROVIDER_ANTHROPIC) {
+    return provider;
+  }
+  throw Object.assign(new Error('Unsupported upstream provider route'), {
+    code: 'INVALID_UPSTREAM_PROVIDER',
+    status: 400
+  });
+}
+
+function getUpstreamConfig(config, provider) {
+  const configured = config.upstreamProviders?.[provider];
+  if (configured) return configured;
+
+  return {
+    provider,
+    baseUrl: config.upstreamBaseUrl,
+    apiKey: config.upstreamApiKey,
+    authScheme: config.upstreamAuthScheme ?? 'Bearer',
+    anthropicVersion: config.anthropicVersion,
+    anthropicBeta: config.anthropicBeta
+  };
+}
+
+function buildProviderUpstreamUrl(upstream, requestPath) {
+  const base = new URL(upstream.baseUrl);
+  const request = new URL(requestPath, 'http://relay.local');
+  const basePath = base.pathname.replace(/\/+$/, '');
+  const requestPathname = request.pathname.replace(/^\/+/, '');
+  base.pathname = `${basePath}/${requestPathname}`.replace(/\/{2,}/g, '/');
+  base.search = request.search;
+  base.hash = '';
+  return base.toString();
+}
+
+function buildProviderUpstreamHeaders(headers, upstream) {
   const forwarded = {};
   for (const [rawKey, rawValue] of Object.entries(headers ?? {})) {
     const key = rawKey.toLowerCase();
-    if (key === 'authorization' || key === 'content-length' || key === 'host') continue;
+    if (key === 'authorization' || key === 'x-api-key' || key === 'content-length' || key === 'host') continue;
     forwarded[key] = String(rawValue);
   }
-  if (config.upstreamApiKey) {
-    forwarded.authorization = `${config.upstreamAuthScheme} ${config.upstreamApiKey}`;
+
+  if (upstream.provider === UPSTREAM_PROVIDER_ANTHROPIC) {
+    if (upstream.apiKey) forwarded['x-api-key'] = upstream.apiKey;
+    if (upstream.anthropicVersion) forwarded['anthropic-version'] = upstream.anthropicVersion;
+    if (upstream.anthropicBeta) forwarded['anthropic-beta'] = upstream.anthropicBeta;
+    return forwarded;
+  }
+
+  if (upstream.apiKey) {
+    forwarded.authorization = `${upstream.authScheme ?? 'Bearer'} ${upstream.apiKey}`;
   }
   return forwarded;
+}
+
+function upstreamProvider(config) {
+  return config.upstreamProvider ?? UPSTREAM_PROVIDER_OPENAI;
 }
 
 function allowsBody(method) {

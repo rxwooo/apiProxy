@@ -60,6 +60,21 @@ async function startStack(upstreamHandler, overrides = {}) {
   const upstreamPort = await listen(upstream);
   const e2eeEnabled = Boolean(overrides.e2ee);
   const e2eeKeyId = overrides.relayE2eeKeyId ?? 'main';
+  const upstreamProviders = overrides.upstreamProviders ?? {
+    openai: {
+      provider: 'openai',
+      baseUrl: `http://127.0.0.1:${upstreamPort}`,
+      apiKey: overrides.openaiApiKey ?? overrides.upstreamApiKey ?? 'upstream-token',
+      authScheme: overrides.openaiAuthScheme ?? overrides.upstreamAuthScheme ?? 'Bearer'
+    },
+    anthropic: {
+      provider: 'anthropic',
+      baseUrl: `http://127.0.0.1:${upstreamPort}`,
+      apiKey: overrides.anthropicApiKey ?? overrides.upstreamApiKey ?? 'upstream-token',
+      anthropicVersion: overrides.anthropicVersion,
+      anthropicBeta: overrides.anthropicBeta
+    }
+  };
 
   const remoteConfig = commonConfig({
     host: '127.0.0.1',
@@ -67,8 +82,13 @@ async function startStack(upstreamHandler, overrides = {}) {
     relayPath: '/relay',
     relayToken: overrides.remoteToken ?? 'relay-token',
     upstreamBaseUrl: `http://127.0.0.1:${upstreamPort}`,
-    upstreamApiKey: 'upstream-token',
-    upstreamAuthScheme: 'Bearer',
+    upstreamRouting: overrides.upstreamRouting ?? 'single',
+    upstreamProvider: overrides.upstreamProvider,
+    upstreamProviders,
+    upstreamApiKey: overrides.upstreamApiKey ?? 'upstream-token',
+    upstreamAuthScheme: overrides.upstreamAuthScheme ?? 'Bearer',
+    anthropicVersion: overrides.anthropicVersion,
+    anthropicBeta: overrides.anthropicBeta,
     modelIdMap: overrides.modelIdMap ?? {},
     requestTimeoutMs: overrides.requestTimeoutMs ?? 1000,
     relayE2eeMode: overrides.remoteE2eeMode ?? (e2eeEnabled ? REQUIRED_E2EE_MODE : 'off'),
@@ -111,6 +131,76 @@ async function startStack(upstreamHandler, overrides = {}) {
       await closeServer(local);
       await closeServer(remote);
       await closeServer(upstream);
+    }
+  };
+}
+
+async function startAutoRoutingStack({
+  openaiHandler,
+  anthropicHandler,
+  defaultProvider = 'openai',
+  anthropicBasePath = ''
+} = {}) {
+  const openaiUpstream = createServer(openaiHandler);
+  const openaiPort = await listen(openaiUpstream);
+  const anthropicUpstream = createServer(anthropicHandler);
+  const anthropicPort = await listen(anthropicUpstream);
+
+  const remoteConfig = commonConfig({
+    host: '127.0.0.1',
+    port: 0,
+    relayPath: '/relay',
+    relayToken: 'relay-token',
+    upstreamRouting: 'auto',
+    upstreamProvider: defaultProvider,
+    upstreamProviders: {
+      openai: {
+        provider: 'openai',
+        baseUrl: `http://127.0.0.1:${openaiPort}`,
+        apiKey: 'openai-token',
+        authScheme: 'Bearer'
+      },
+      anthropic: {
+        provider: 'anthropic',
+        baseUrl: `http://127.0.0.1:${anthropicPort}${anthropicBasePath}`,
+        apiKey: 'anthropic-token',
+        anthropicVersion: '2023-06-01',
+        anthropicBeta: 'test-beta'
+      }
+    },
+    upstreamBaseUrl: `http://127.0.0.1:${openaiPort}`,
+    upstreamApiKey: 'openai-token'
+  });
+  const remote = createRemoteRelayServer(remoteConfig, { logger });
+  const remotePort = await listen(remote);
+
+  const localConfig = commonConfig({
+    host: '127.0.0.1',
+    port: 0,
+    relayUrl: `ws://127.0.0.1:${remotePort}/relay`,
+    relayToken: 'relay-token',
+    relayProxy: '',
+    relayNoProxy: [],
+    relayE2eeMode: 'off'
+  });
+  const relayClient = new RelayClient(localConfig, { logger });
+  const local = createLocalProxyServer(localConfig, { relayClient, logger });
+  const localPort = await listen(local);
+
+  return {
+    remote,
+    local,
+    relayClient,
+    openaiUpstream,
+    anthropicUpstream,
+    localUrl: `http://127.0.0.1:${localPort}`,
+    async close() {
+      await relayClient.close();
+      remote.wss?.clients.forEach((client) => client.terminate());
+      await closeServer(local);
+      await closeServer(remote);
+      await closeServer(openaiUpstream);
+      await closeServer(anthropicUpstream);
     }
   };
 }
@@ -357,6 +447,383 @@ test('relays GET /v1/models through the upstream path', async () => {
       object: 'list',
       data: [{ id: 'test-model' }]
     });
+  } finally {
+    await stack.close();
+  }
+});
+
+test('relays native Anthropic messages and applies remote Anthropic headers', async () => {
+  let upstreamPath;
+  let upstreamBody;
+  let upstreamHeaders;
+  const stack = await startStack(
+    async (request, response) => {
+      upstreamPath = request.url;
+      upstreamHeaders = request.headers;
+      upstreamBody = await readRequestBody(request);
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(
+        JSON.stringify({
+          id: 'msg_test',
+          type: 'message',
+          role: 'assistant',
+          model: 'claude-test',
+          content: [{ type: 'text', text: 'hello' }]
+        })
+      );
+    },
+    {
+      upstreamProvider: 'anthropic',
+      anthropicVersion: '2023-06-01',
+      anthropicBeta: 'test-beta'
+    }
+  );
+
+  try {
+    const body = JSON.stringify({
+      model: 'claude-test',
+      max_tokens: 64,
+      messages: [{ role: 'user', content: 'hello' }]
+    });
+    const response = await fetch(`${stack.localUrl}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer client-token',
+        'x-api-key': 'client-anthropic-key',
+        'anthropic-version': 'client-version'
+      },
+      body
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(upstreamPath, '/v1/messages');
+    assert.equal(upstreamBody.toString(), body);
+    assert.equal(upstreamHeaders['x-api-key'], 'upstream-token');
+    assert.equal(upstreamHeaders['anthropic-version'], '2023-06-01');
+    assert.equal(upstreamHeaders['anthropic-beta'], 'test-beta');
+    assert.equal(upstreamHeaders.authorization, undefined);
+    assert.deepEqual(await response.json(), {
+      id: 'msg_test',
+      type: 'message',
+      role: 'assistant',
+      model: 'claude-test',
+      content: [{ type: 'text', text: 'hello' }]
+    });
+  } finally {
+    await stack.close();
+  }
+});
+
+test('relays native Anthropic token counting requests', async () => {
+  let upstreamPath;
+  let upstreamBody;
+  const stack = await startStack(
+    async (request, response) => {
+      upstreamPath = request.url;
+      upstreamBody = await readRequestBody(request);
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ input_tokens: 7 }));
+    },
+    { upstreamProvider: 'anthropic', anthropicVersion: '2023-06-01' }
+  );
+
+  try {
+    const body = JSON.stringify({
+      model: 'claude-test',
+      messages: [{ role: 'user', content: 'count me' }]
+    });
+    const response = await fetch(`${stack.localUrl}/v1/messages/count_tokens`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(upstreamPath, '/v1/messages/count_tokens');
+    assert.equal(upstreamBody.toString(), body);
+    assert.deepEqual(await response.json(), { input_tokens: 7 });
+  } finally {
+    await stack.close();
+  }
+});
+
+test('relays native Anthropic model list responses without schema conversion', async () => {
+  let upstreamPath;
+  const upstreamResponse = {
+    data: [{ id: 'claude-test', type: 'model', display_name: 'Claude Test' }],
+    has_more: false,
+    first_id: 'claude-test',
+    last_id: 'claude-test'
+  };
+  const stack = await startStack(
+    async (request, response) => {
+      upstreamPath = request.url;
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify(upstreamResponse));
+    },
+    { upstreamProvider: 'anthropic', anthropicVersion: '2023-06-01' }
+  );
+
+  try {
+    const response = await fetch(`${stack.localUrl}/v1/models`);
+    assert.equal(response.status, 200);
+    assert.equal(upstreamPath, '/v1/models');
+    assert.deepEqual(await response.json(), upstreamResponse);
+  } finally {
+    await stack.close();
+  }
+});
+
+test('relays native Anthropic SSE streams without OpenAI event conversion', async () => {
+  let upstreamPayload;
+  const stack = await startStack(
+    async (request, response) => {
+      upstreamPayload = JSON.parse((await readRequestBody(request)).toString('utf8'));
+      response.writeHead(200, { 'content-type': 'text/event-stream' });
+      response.write(
+        'event: message_start\n' +
+          'data: {"type":"message_start","message":{"id":"msg_test","type":"message","model":"claude-test","content":[]}}\n\n'
+      );
+      response.write(
+        'event: content_block_delta\n' +
+          'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\n'
+      );
+      response.end('event: message_stop\ndata: {"type":"message_stop"}\n\n');
+    },
+    { upstreamProvider: 'anthropic', anthropicVersion: '2023-06-01' }
+  );
+
+  try {
+    const response = await fetch(`${stack.localUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-test',
+        max_tokens: 64,
+        stream: true,
+        messages: [{ role: 'user', content: 'stream' }]
+      })
+    });
+
+    assert.equal(response.status, 200);
+    const body = await response.text();
+    assert.equal(upstreamPayload.stream, true);
+    assert.match(body, /event: message_start/);
+    assert.match(body, /content_block_delta/);
+    assert.match(body, /text_delta/);
+    assert.doesNotMatch(body, /"choices"/);
+  } finally {
+    await stack.close();
+  }
+});
+
+test('auto routing sends OpenAI and Anthropic paths to separate upstream providers', async () => {
+  const hits = [];
+  const stack = await startAutoRoutingStack({
+    openaiHandler: async (request, response) => {
+      hits.push({
+        provider: 'openai',
+        path: request.url,
+        authorization: request.headers.authorization,
+        apiKey: request.headers['x-api-key']
+      });
+      await readRequestBody(request);
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ provider: 'openai' }));
+    },
+    anthropicHandler: async (request, response) => {
+      hits.push({
+        provider: 'anthropic',
+        path: request.url,
+        authorization: request.headers.authorization,
+        apiKey: request.headers['x-api-key'],
+        version: request.headers['anthropic-version'],
+        beta: request.headers['anthropic-beta']
+      });
+      await readRequestBody(request);
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ provider: 'anthropic' }));
+    }
+  });
+
+  try {
+    const openaiResponse = await fetch(`${stack.localUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-test', messages: [] })
+    });
+    const anthropicResponse = await fetch(`${stack.localUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-test', max_tokens: 64, messages: [] })
+    });
+    const tokenCountResponse = await fetch(`${stack.localUrl}/v1/messages/count_tokens`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-test', messages: [] })
+    });
+
+    assert.deepEqual(await openaiResponse.json(), { provider: 'openai' });
+    assert.deepEqual(await anthropicResponse.json(), { provider: 'anthropic' });
+    assert.deepEqual(await tokenCountResponse.json(), { provider: 'anthropic' });
+    assert.deepEqual(
+      hits.map((hit) => hit.provider),
+      ['openai', 'anthropic', 'anthropic']
+    );
+    assert.equal(hits[0].path, '/v1/chat/completions');
+    assert.equal(hits[0].authorization, 'Bearer openai-token');
+    assert.equal(hits[0].apiKey, undefined);
+    assert.equal(hits[1].path, '/v1/messages');
+    assert.equal(hits[1].authorization, undefined);
+    assert.equal(hits[1].apiKey, 'anthropic-token');
+    assert.equal(hits[1].version, '2023-06-01');
+    assert.equal(hits[1].beta, 'test-beta');
+    assert.equal(hits[2].path, '/v1/messages/count_tokens');
+  } finally {
+    await stack.close();
+  }
+});
+
+test('auto routing preserves upstream base URL path prefixes', async () => {
+  let anthropicPath;
+  const stack = await startAutoRoutingStack({
+    anthropicBasePath: '/anthropic',
+    openaiHandler: async (_request, response) => {
+      response.writeHead(500);
+      response.end('should not be called');
+    },
+    anthropicHandler: async (request, response) => {
+      anthropicPath = request.url;
+      await readRequestBody(request);
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ ok: true }));
+    }
+  });
+
+  try {
+    const response = await fetch(`${stack.localUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-test', max_tokens: 64, messages: [] })
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(anthropicPath, '/anthropic/v1/messages');
+  } finally {
+    await stack.close();
+  }
+});
+
+test('auto routing selects model provider by query and strips routing parameter', async () => {
+  const hits = [];
+  const stack = await startAutoRoutingStack({
+    openaiHandler: async (request, response) => {
+      hits.push({ provider: 'openai', path: request.url });
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ provider: 'openai-models' }));
+    },
+    anthropicHandler: async (request, response) => {
+      hits.push({ provider: 'anthropic', path: request.url });
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ provider: 'anthropic-models' }));
+    }
+  });
+
+  try {
+    const anthropicResponse = await fetch(`${stack.localUrl}/v1/models?provider=anthropic&limit=2`);
+    const openaiResponse = await fetch(`${stack.localUrl}/v1/models?provider=openai`);
+
+    assert.deepEqual(await anthropicResponse.json(), { provider: 'anthropic-models' });
+    assert.deepEqual(await openaiResponse.json(), { provider: 'openai-models' });
+    assert.deepEqual(hits, [
+      { provider: 'anthropic', path: '/v1/models?limit=2' },
+      { provider: 'openai', path: '/v1/models' }
+    ]);
+  } finally {
+    await stack.close();
+  }
+});
+
+test('auto routing uses default provider for model list without query', async () => {
+  const hits = [];
+  const stack = await startAutoRoutingStack({
+    defaultProvider: 'anthropic',
+    openaiHandler: async (_request, response) => {
+      hits.push('openai');
+      response.writeHead(500);
+      response.end('should not be called');
+    },
+    anthropicHandler: async (request, response) => {
+      hits.push(`anthropic:${request.url}`);
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ provider: 'anthropic-default' }));
+    }
+  });
+
+  try {
+    const response = await fetch(`${stack.localUrl}/v1/models`);
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { provider: 'anthropic-default' });
+    assert.deepEqual(hits, ['anthropic:/v1/models']);
+  } finally {
+    await stack.close();
+  }
+});
+
+test('auto routing rejects unsupported model provider query', async () => {
+  let upstreamCalled = false;
+  const stack = await startAutoRoutingStack({
+    openaiHandler: async (_request, response) => {
+      upstreamCalled = true;
+      response.writeHead(500);
+      response.end('should not be called');
+    },
+    anthropicHandler: async (_request, response) => {
+      upstreamCalled = true;
+      response.writeHead(500);
+      response.end('should not be called');
+    }
+  });
+
+  try {
+    const response = await fetch(`${stack.localUrl}/v1/models?provider=unsupported`);
+
+    assert.equal(response.status, 400);
+    assert.equal((await response.json()).error.code, 'INVALID_UPSTREAM_PROVIDER');
+    assert.equal(upstreamCalled, false);
+  } finally {
+    await stack.close();
+  }
+});
+
+test('single-provider routing keeps routing all allowed paths to configured provider', async () => {
+  let upstreamPath;
+  let upstreamHeaders;
+  const stack = await startStack(
+    async (request, response) => {
+      upstreamPath = request.url;
+      upstreamHeaders = request.headers;
+      await readRequestBody(request);
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ ok: true }));
+    },
+    { upstreamProvider: 'anthropic', anthropicVersion: '2023-06-01' }
+  );
+
+  try {
+    const response = await fetch(`${stack.localUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-test', messages: [] })
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(upstreamPath, '/v1/chat/completions');
+    assert.equal(upstreamHeaders['x-api-key'], 'upstream-token');
+    assert.equal(upstreamHeaders['anthropic-version'], '2023-06-01');
+    assert.equal(upstreamHeaders.authorization, undefined);
   } finally {
     await stack.close();
   }

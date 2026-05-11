@@ -10,6 +10,16 @@ import { getRelayProxyDiagnostics, parseRelayNoProxy, parseRelayProxy } from './
 
 const DEFAULT_MAX_REQUEST_BYTES = 10 * 1024 * 1024;
 const DEFAULT_MAX_RESPONSE_BYTES = 50 * 1024 * 1024;
+export const UPSTREAM_PROVIDER_OPENAI = 'openai';
+export const UPSTREAM_PROVIDER_ANTHROPIC = 'anthropic';
+export const UPSTREAM_ROUTING_SINGLE = 'single';
+export const UPSTREAM_ROUTING_AUTO = 'auto';
+const UPSTREAM_PROVIDERS = [UPSTREAM_PROVIDER_OPENAI, UPSTREAM_PROVIDER_ANTHROPIC];
+const UPSTREAM_ROUTING_MODES = [UPSTREAM_ROUTING_SINGLE, UPSTREAM_ROUTING_AUTO];
+const DEFAULT_UPSTREAM_BASE_URLS = {
+  [UPSTREAM_PROVIDER_OPENAI]: 'https://api.openai.com',
+  [UPSTREAM_PROVIDER_ANTHROPIC]: 'https://api.anthropic.com'
+};
 
 export function parseDotEnv(content) {
   const parsed = {};
@@ -61,6 +71,22 @@ function numberValue(env, key, fallback) {
 function stringValue(env, key, fallback = '') {
   const raw = env[key];
   return raw === undefined || raw === '' ? fallback : raw;
+}
+
+export function parseUpstreamProvider(raw = UPSTREAM_PROVIDER_OPENAI) {
+  const provider = String(raw || UPSTREAM_PROVIDER_OPENAI).trim().toLowerCase();
+  if (!UPSTREAM_PROVIDERS.includes(provider)) {
+    throw new Error(`UPSTREAM_PROVIDER must be one of: ${UPSTREAM_PROVIDERS.join(', ')}`);
+  }
+  return provider;
+}
+
+export function parseUpstreamRouting(raw = UPSTREAM_ROUTING_SINGLE) {
+  const routing = String(raw || UPSTREAM_ROUTING_SINGLE).trim().toLowerCase();
+  if (!UPSTREAM_ROUTING_MODES.includes(routing)) {
+    throw new Error(`UPSTREAM_ROUTING must be one of: ${UPSTREAM_ROUTING_MODES.join(', ')}`);
+  }
+  return routing;
 }
 
 function parseE2eeMode(raw = E2EE_MODE_OFF) {
@@ -191,6 +217,72 @@ function validateRemoteE2ee(config) {
   }
 }
 
+function validateRemoteProvider(config) {
+  const providers =
+    config.upstreamRouting === UPSTREAM_ROUTING_AUTO
+      ? [UPSTREAM_PROVIDER_OPENAI, UPSTREAM_PROVIDER_ANTHROPIC]
+      : [config.upstreamProvider];
+  if (providers.includes(UPSTREAM_PROVIDER_ANTHROPIC) && !config.upstreamProviders.anthropic.anthropicVersion) {
+    throw new Error('ANTHROPIC_VERSION is required when Anthropic upstream can be selected');
+  }
+}
+
+function validateProductionRemoteProvider(config) {
+  const providers =
+    config.upstreamRouting === UPSTREAM_ROUTING_AUTO
+      ? [UPSTREAM_PROVIDER_OPENAI, UPSTREAM_PROVIDER_ANTHROPIC]
+      : [config.upstreamProvider];
+  for (const provider of providers) {
+    const upstream = config.upstreamProviders[provider];
+    if (!upstream.apiKey) {
+      const keyName =
+        config.upstreamRouting === UPSTREAM_ROUTING_AUTO
+          ? `${provider.toUpperCase()}_API_KEY`
+          : 'UPSTREAM_API_KEY';
+      throw new Error(`${keyName} is required in production`);
+    }
+    if (!upstream.baseUrl.startsWith('https://')) {
+      const urlName =
+        config.upstreamRouting === UPSTREAM_ROUTING_AUTO
+          ? `${provider.toUpperCase()}_BASE_URL`
+          : 'UPSTREAM_BASE_URL';
+      throw new Error(`${urlName} must use https:// in production`);
+    }
+  }
+}
+
+function createProviderConfigs(env, upstreamProvider) {
+  const legacyBaseUrl = stringValue(env, 'UPSTREAM_BASE_URL');
+  const legacyApiKey = stringValue(env, 'UPSTREAM_API_KEY');
+  const legacyAuthScheme = stringValue(env, 'UPSTREAM_AUTH_SCHEME', 'Bearer');
+  const legacyBaseUrlFor = (provider) => (upstreamProvider === provider ? legacyBaseUrl : '');
+  const legacyApiKeyFor = (provider) => (upstreamProvider === provider ? legacyApiKey : '');
+
+  return {
+    [UPSTREAM_PROVIDER_OPENAI]: {
+      provider: UPSTREAM_PROVIDER_OPENAI,
+      baseUrl: stringValue(
+        env,
+        'OPENAI_BASE_URL',
+        legacyBaseUrlFor(UPSTREAM_PROVIDER_OPENAI) || DEFAULT_UPSTREAM_BASE_URLS.openai
+      ),
+      apiKey: stringValue(env, 'OPENAI_API_KEY', legacyApiKeyFor(UPSTREAM_PROVIDER_OPENAI)),
+      authScheme: stringValue(env, 'OPENAI_AUTH_SCHEME', legacyAuthScheme)
+    },
+    [UPSTREAM_PROVIDER_ANTHROPIC]: {
+      provider: UPSTREAM_PROVIDER_ANTHROPIC,
+      baseUrl: stringValue(
+        env,
+        'ANTHROPIC_BASE_URL',
+        legacyBaseUrlFor(UPSTREAM_PROVIDER_ANTHROPIC) || DEFAULT_UPSTREAM_BASE_URLS.anthropic
+      ),
+      apiKey: stringValue(env, 'ANTHROPIC_API_KEY', legacyApiKeyFor(UPSTREAM_PROVIDER_ANTHROPIC)),
+      anthropicVersion: stringValue(env, 'ANTHROPIC_VERSION'),
+      anthropicBeta: stringValue(env, 'ANTHROPIC_BETA')
+    }
+  };
+}
+
 export function createLocalConfig(options = {}) {
   const env = loadConfigEnv(options);
   const config = {
@@ -226,31 +318,40 @@ export function createLocalConfig(options = {}) {
 
 export function createRemoteConfig(options = {}) {
   const env = loadConfigEnv(options);
+  const upstreamRouting = parseUpstreamRouting(stringValue(env, 'UPSTREAM_ROUTING', UPSTREAM_ROUTING_SINGLE));
+  const upstreamProvider = parseUpstreamProvider(stringValue(env, 'UPSTREAM_PROVIDER', UPSTREAM_PROVIDER_OPENAI));
+  const upstreamProviders = createProviderConfigs(env, upstreamProvider);
+  const selectedUpstream = upstreamProviders[upstreamProvider];
   const config = {
     ...commonConfig(env),
     host: stringValue(env, 'RELAY_HOST', '0.0.0.0'),
     port: numberValue(env, 'RELAY_PORT', 8788),
     relayPath: stringValue(env, 'RELAY_PATH', '/relay'),
     relayToken: stringValue(env, 'RELAY_TOKEN'),
-    upstreamBaseUrl: stringValue(env, 'UPSTREAM_BASE_URL', 'https://api.openai.com'),
-    upstreamApiKey: stringValue(env, 'UPSTREAM_API_KEY'),
-    upstreamAuthScheme: stringValue(env, 'UPSTREAM_AUTH_SCHEME', 'Bearer'),
+    upstreamRouting,
+    upstreamProvider,
+    upstreamProviders,
+    upstreamBaseUrl: selectedUpstream.baseUrl,
+    upstreamApiKey: selectedUpstream.apiKey,
+    upstreamAuthScheme: selectedUpstream.authScheme ?? 'Bearer',
+    anthropicVersion: upstreamProviders.anthropic.anthropicVersion,
+    anthropicBeta: upstreamProviders.anthropic.anthropicBeta,
     modelIdMap: parseModelIdMap(stringValue(env, 'MODEL_ID_MAP')),
     ...remoteE2eeConfig(env)
   };
 
   validateCommon(config);
   validateRemoteE2ee(config);
+  validateRemoteProvider(config);
   assertPositive('RELAY_PORT', config.port);
   if (!config.relayPath.startsWith('/')) throw new Error('RELAY_PATH must start with /');
-  new URL(config.upstreamBaseUrl);
+  for (const upstream of Object.values(config.upstreamProviders)) {
+    new URL(upstream.baseUrl);
+  }
 
   if (config.nodeEnv === 'production') {
     if (!config.relayToken) throw new Error('RELAY_TOKEN is required in production');
-    if (!config.upstreamApiKey) throw new Error('UPSTREAM_API_KEY is required in production');
-    if (!config.upstreamBaseUrl.startsWith('https://')) {
-      throw new Error('UPSTREAM_BASE_URL must use https:// in production');
-    }
+    validateProductionRemoteProvider(config);
   }
 
   return config;

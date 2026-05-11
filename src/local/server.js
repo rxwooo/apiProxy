@@ -2,6 +2,8 @@ import { createServer } from 'node:http';
 import { filterResponseHeaders, parseJsonBody, readRequestBody, selectForwardHeaders, sendJson } from '../shared/http.js';
 import { RelayResponseError, RelayTimeoutError, RelayUnavailableError } from './relayClient.js';
 
+const CORS_ALLOW_HEADERS = 'authorization,content-type,x-api-key,anthropic-version,anthropic-beta';
+
 export function createLocalProxyServer(config, { relayClient, logger }) {
   return createServer(async (request, response) => {
     const startedAt = Date.now();
@@ -17,18 +19,13 @@ export function createLocalProxyServer(config, { relayClient, logger }) {
         response.writeHead(204, {
           'access-control-allow-origin': '*',
           'access-control-allow-methods': 'GET,POST,OPTIONS',
-          'access-control-allow-headers': 'authorization,content-type'
+          'access-control-allow-headers': CORS_ALLOW_HEADERS
         });
         response.end();
         return;
       }
 
-      if (request.method === 'POST' && url.pathname === '/v1/chat/completions') {
-        await relayHttpRequest({ request, response, url, config, relayClient, logger, startedAt });
-        return;
-      }
-
-      if (request.method === 'GET' && url.pathname === '/v1/models') {
+      if (isRelayableRequest(request.method, url.pathname)) {
         await relayHttpRequest({ request, response, url, config, relayClient, logger, startedAt });
         return;
       }
@@ -100,8 +97,16 @@ async function relayHttpRequest({ request, response, url, config, relayClient, l
   }
 }
 
+function isRelayableRequest(method, pathname) {
+  return (
+    (method === 'POST' &&
+      ['/v1/chat/completions', '/v1/messages', '/v1/messages/count_tokens'].includes(pathname)) ||
+    (method === 'GET' && pathname === '/v1/models')
+  );
+}
+
 function isStreamRequest(pathname, body) {
-  if (pathname !== '/v1/chat/completions' || !body.length) return false;
+  if (!['/v1/chat/completions', '/v1/messages'].includes(pathname) || !body.length) return false;
   try {
     const parsed = parseJsonBody(body);
     return Boolean(parsed?.stream);
